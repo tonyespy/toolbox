@@ -31,7 +31,6 @@ print_help_lxd_snapcraft () {
   echo -e "Usage: lxd_snapcraft [container arch] [snapcraft commands..]\n"
   echo -e "\tsnapcraft is run in the current directory, but inside the container"
   echo -e "\tname of the container is determined from project's snapcraft.yaml"
-  echo -e "\t\tunless passed through env variable 'snapcraft_lxd_container_name"
   echo -e "\tcontainer name is constructed as 'snapcraft-<ubuntu series>[-<architecture>]'"
   echo -e "\t\tcontainers with native architecture do not have arch in the name"
   echo -e "\t\tif container does not exist, it will be created"
@@ -208,17 +207,18 @@ lxd_ensure_container_runnig() {
 }
 
 lxd_ensure_container () {
-  # normalise series, we only support UC16/18/20 and related LTS
+  # normalise series, we only support UC16/18/2* and related LTS
+  # 24.04 -> noble
   # 22.04 -> jammy
   # 20.04 -> focal
   # 18.04 -> bionic
   # 16.04 -> xenial
   case $1 in
-    23.04 | lunar)
-      local ubuntu_series="lunar"
+    24.04 | noble)
+      local ubuntu_series="noble"
       ;;
-    22.10 | kinetic)
-      local ubuntu_series="kinetic"
+    23.10 | mantic)
+      local ubuntu_series="mantic"
       ;;
     22.04 | jammy)
       local ubuntu_series="jammy"
@@ -292,8 +292,8 @@ lxd_ensure_container () {
   lxc exec ${container_name} -- sh -c 'cp -r /etc/skel/. /home/ubuntu'
   lxc exec ${container_name} -- sh -c 'echo "export SNAPCRAFT_BUILD_ENVIRONMENT=host" >> /etc/environment'
   lxc exec ${container_name} -- sh -c 'echo "export SNAPCRAFT_ENABLE_EXPERIMENTAL_TARGET_ARCH=true" >> /etc/environment'
-  # snapcraft 7.x does not like to run apt as root, setup wrappers if this jammy container
-  if [ "${ubuntu_series}" == "jammy" ]; then
+  # snapcraft 7.x+ does not like to run apt as root, setup wrappers if this jammy container
+  if [ "${ubuntu_series}" == "jammy" ] || [ "${ubuntu_series}" == "noble" ] ; then
     local tmp_wrapper=$(mktemp -u -q)
     tee ${tmp_wrapper} <<EOF
 #!/bin/sh
@@ -355,6 +355,17 @@ sudo /usr/bin/apt-config "\$@"
 EOF
 
     lxc file push ${tmp_wrapper} ${container_name}/usr/local/bin/apt-config
+    tee ${tmp_wrapper} <<EOF
+#!/bin/sh
+if [ "\${1}" = "install" ]; then
+  sudo /usr/bin/snap "\$@"
+else
+  /usr/bin/snap "\$@"
+fi
+EOF
+
+    lxc file push ${tmp_wrapper} ${container_name}/usr/local/bin/snap
+
     [ -e ${tmp_wrapper} ] && rm ${tmp_wrapper}
     lxc exec ${container_name} -- sh -c 'chown root:root /usr/local/bin/*'
     lxc exec ${container_name} -- sh -c 'chmod 755 /usr/local/bin/*'
@@ -446,6 +457,59 @@ EOF
   fi
 }
 
+# try to resolve snapcraft.yaml path in the current directory
+lxd_get_snap_base() {
+  for sy in snapcraft.yaml snap/snapcraft.yaml build-aux/snapcraft.yaml build-aux/snap/snapcraft.yaml
+  do
+    if [ -e ${sy} ]; then
+      snapcraft_yaml="${sy}"
+      return
+    fi
+  done
+}
+
+# If this is core22 base, in 9 out of 10 cases snapcraft will build too much unless --build-for
+# is passed. Check supported target arches for a given host if more than 1 is supported
+# pick one matching host or bail out asking the user which one to build
+# There is really no good valid use case for day-to-day development to always build all supported arches.
+# This often trashes development env if one wants to just run incremental build.
+# This check requires 'yq' parser to be installed.
+lxd_get_target_arch() {
+  local snapcraft_yaml=${1}
+  local base=${2}
+  if [ "${base}" = "core22" ] && [ -n "$(which yq)" ] && [[ $@ != *"--build-for"* ]]; then
+    # determine host arch
+    local host_arch="amd64"
+    case $(uname -m) in
+      aarch64)
+        host_arch="arm64"
+        ;;
+      armv7l)
+        host_arch="armhf"
+        ;;
+      riscv64)
+        host_arch="riscv"
+        ;;
+      x86_64)
+        host_arch="amd64"
+        ;;
+    esac
+    local supported_arches="$(host_arch=${host_arch} yq '.architectures[] | select( [ .build-on[] | contains(env(host_arch)) ] | any) | .build-for' ${snapcraft_yaml})"
+    # if there are more than 2 matching targets check if one matches host, if not bail
+    if [ $(echo ${supported_arches} | wc -w) -gt 1 ]; then
+      if [[ ${supported_arches} == *"${host_arch}"* ]]; then
+        echo "snap arch definition supports multiple arches for this host, auto picking host matching one (${host_arch})" >&2
+        target_arch="--build-for=${host_arch}"
+        return 0
+      else
+        echo "Arch definition in snapcraft.yaml supports multiple arches for this host, please specify which one you want to build" >&2
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
 lxd_snapcraft () {
   # handle special case first parameter:
   #   -h: print help, (snapcraft help is "snapcraft help)"
@@ -470,72 +534,56 @@ lxd_snapcraft () {
   lxd_ensure
 
   # make sure we have container and it's running
-  if [ -z "${snapcraft_lxd_container_name}" ]; then
-    # if there is snapcraft.yaml or snap/snapcraft.yaml in project root
-    # or under build-aux dir
-    # try to determine which container to use
-    for sy in snapcraft.yaml snap/snapcraft.yaml build-aux/snapcraft.yaml build-aux/snap/snapcraft.yaml
-    do
-      if [ -e ${sy} ]; then
-        local SNAPCRAFT_YAML="${sy}"
-        continue
-      fi
-    done
-    if [ -n "${SNAPCRAFT_YAML}" ]; then
-      # use build-base and then base as means to determine build series
-      local base=$(grep 'build-base:' ${SNAPCRAFT_YAML} | awk '{print $2}')
-      [ -z "${base}" ] && base=$(grep 'base:' ${SNAPCRAFT_YAML} | awk '{print $2}')
-      case ${base} in
-        core16|core)
-          local container_name="snapcraft-xenial${container_flavour}"
-          local ubuntu_series="xenial"
-          ;;
-        core18)
-          local container_name="snapcraft-bionic${container_flavour}"
-          local ubuntu_series="bionic"
-          ;;
-        core20)
-          local container_name="snapcraft-focal${container_flavour}"
-          local ubuntu_series="focal"
-          ;;
-        core22)
-          local container_name="snapcraft-jammy${container_flavour}"
-          local ubuntu_series="jammy"
-          ;;
-        core24)
-          local container_name="snapcraft-jammy${container_flavour}"
-          local ubuntu_series="lunar"
-          ;;
-        *)
-          echo "Base not defined, assuming Core 16"
-          local container_name="snapcraft-xenial${container_flavour}"
-          local ubuntu_series="xenial"
-          ;;
-      esac
-      local snap_type=$(grep -m 1 'type:' ${SNAPCRAFT_YAML} | awk '{print $2}')
-      # if we are building base or snapd, run build as root
-      if [ "${snap_type}" == "base" ] || [ "${snap_type}" == "snapd" ]; then
-        echo "Automatically building snap type ${snap_type} as root"
-        local root_build="sudo "
-      fi
-    else
-      echo -e "Not in snapcraft project directory, or container name defined\n"
-      print_help_lxd_snapcraft
-      exit 0
+  # try to determine which container to use
+  lxd_get_snap_base
+  if [ -n "${snapcraft_yaml}" ]; then
+    # use build-base and then base as means to determine build series
+    local base=$(grep 'build-base:' ${snapcraft_yaml} | awk '{print $2}')
+    [ -z "${base}" ] && base=$(grep 'base:' ${snapcraft_yaml} | awk '{print $2}')
+    case ${base} in
+      core16|core)
+        local ubuntu_series="xenial"
+        ;;
+      core18)
+        local ubuntu_series="bionic"
+        ;;
+      core20)
+        local ubuntu_series="focal"
+        ;;
+      core22)
+        local ubuntu_series="jammy"
+        ;;
+      core24)
+        local ubuntu_series="noble"
+        ;;
+      *)
+        echo "Base not defined, assuming Core 16"
+        local ubuntu_series="xenial"
+        ;;
+    esac
+    local container_name="snapcraft-${ubuntu_series}${container_flavour}"
+    local snap_type=$(grep -m 1 'type:' ${snapcraft_yaml} | awk '{print $2}')
+    # if we are building base or snapd, run build as root
+    if [ "${snap_type}" == "base" ] || [ "${snap_type}" == "snapd" ]; then
+      echo "Automatically building snap type ${snap_type} as root"
+      local root_build="sudo "
     fi
-    # make sure container exists and its running
-    lxd_ensure_container ${ubuntu_series} ${container_name} ${container_arch}
+
+    lxd_get_target_arch ${snapcraft_yaml} ${base}
+    [ ! 0 -eq ${?} ] && return 0
   else
-    local container_name="${snapcraft_lxd_container_name}"
-    # make sure contanier is running
-    lxd_ensure_container_runnig ${container_name}
+    echo -e "Not in snapcraft project directory\n"
+    print_help_lxd_snapcraft
+    return 0
   fi
+  # make sure container exists and its running
+  lxd_ensure_container ${ubuntu_series} ${container_name} ${container_arch}
 
   # run snapcraft command if we have container ready
-  if [ "$?" = "0" ]; then
-    echo -e "Running snapcraft in '${container_name}' container:[snapcraft $@]"
-    ssh -A -t -q ${container_name}.lxd "cd $(pwd | sed 's|'"${HOME}"'|/home/ubuntu/host|g');${root_build} snapcraft $@"
+  if [ ${?} -eq 0 ]; then
+    echo -e "Running snapcraft in container: '${container_name}', command [snapcraft $@ ${target_arch}]"
+    ssh -A -t -q ${container_name}.lxd "cd $(pwd | sed 's|'"${HOME}"'|/home/ubuntu/host|g');${root_build} snapcraft $@ ${target_arch}"
   else
-    exit 0
+    return 0
   fi
 }
